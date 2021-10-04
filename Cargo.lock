@@ -304,15 +304,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de96540e0ebde571dc55c73d60ef407c653844e6f9a1e2fdbd40c07b9252d812"
 
 [[package]]
-name = "panic-itm"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d577d97d1b31268087b6dddf2470e6794ef5eee87d9dca7fcd0481695391a4c"
-dependencies = [
- "cortex-m 0.7.3",
-]
-
-[[package]]
 name = "panic-rtt-target"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -476,7 +467,6 @@ dependencies = [
  "lazy_static",
  "log",
  "panic-halt",
- "panic-itm",
  "panic-rtt-target",
  "rtt-target 0.2.2",
  "smoltcp",

@@ -1,12 +1,3 @@
-//! Demo for STM32H747I-DISCO eval board using the Real Time for the Masses
-//! (RTIC) framework.
-//!
-//! This demo responds to pings on 192.168.1.99 (IP address hardcoded below)
-//!
-//! We use the SysTick timer to create a 1ms timebase for use with smoltcp.
-//!
-//! The ethernet ring buffers are placed in SRAM3, where they can be
-//! accessed by both the core and the Ethernet DMA.
 #![deny(warnings)]
 #![no_main]
 #![no_std]
@@ -36,6 +27,7 @@ use stm32h7xx_hal::{prelude::*, stm32};
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use stm32h7xx_hal::hal::digital::v2::ToggleableOutputPin;
 /// Configure SYSTICK for 1ms timebase
 fn systick_init(mut syst: stm32::SYST, clocks: CoreClocks) {
     let c_ck_mhz = clocks.c_ck().0 / 1_000_000;
@@ -85,7 +77,7 @@ impl<'a> Net<'a> {
     ) -> Self {
         // Set IP address
         store.ip_addrs =
-            [IpCidr::new(IpAddress::v4(10, 0, 0, 10).into(), 0)];
+            [IpCidr::new(IpAddress::v4(192, 168, 1, 10).into(), 0)];
 
         let neighbor_cache =
             NeighborCache::new(&mut store.neighbor_cache_storage[..]);
@@ -114,26 +106,27 @@ impl<'a> Net<'a> {
     }
 }
 
-use rtt_target::{rprintln, rtt_init_print};
+use rtt_target::{rprintln};
 
 #[app(device = stm32h7xx_hal::stm32, peripherals = true)]
 const APP: () = {
     struct Resources {
         net: Net<'static>,
         lan8742a: ethernet::phy::LAN8742A<ethernet::EthernetMAC>,
-        link_led: gpio::gpioi::PI14<gpio::Output<gpio::PushPull>>,
+        link_led: gpio::gpiob::PB0<gpio::Output<gpio::PushPull>>,
+        usr_led: gpio::gpioe::PE1<gpio::Output<gpio::PushPull>>,
     }
 
     #[init]
     fn init(mut ctx: init::Context) -> init::LateResources {
-        //utilities::logger::init();
-        rtt_init_print!();
+        utilities::logger::init();
+        //rtt_init_print!();
         rprintln!("Start");
-        //info!("Start               ");
+        info!("Start               ");
         // Initialise power...
         let pwr = ctx.device.PWR.constrain();
         let pwrcfg = example_power!(pwr).freeze();
-        rprintln!("Pwr Init");
+        //rprintln!("Pwr Init");
         // Link the SRAM3 power state to CPU1
         ctx.device.RCC.ahb2enr.modify(|_, w| w.sram3en().set_bit());
 
@@ -152,11 +145,16 @@ const APP: () = {
 
         // Initialise IO...
         let gpioa = ctx.device.GPIOA.split(ccdr.peripheral.GPIOA);
+        let gpiob = ctx.device.GPIOB.split(ccdr.peripheral.GPIOB);
         let gpioc = ctx.device.GPIOC.split(ccdr.peripheral.GPIOC);
         let gpiog = ctx.device.GPIOG.split(ccdr.peripheral.GPIOG);
-        let gpioi = ctx.device.GPIOI.split(ccdr.peripheral.GPIOI);
-        let mut link_led = gpioi.pi14.into_push_pull_output(); // LED3
+        let gpioe = ctx.device.GPIOE.split(ccdr.peripheral.GPIOE);
+        //let gpioi = ctx.device.GPIOI.split(ccdr.peripheral.GPIOI);
+        let mut link_led = gpiob.pb0.into_push_pull_output(); // LED3
         link_led.set_high().ok();
+
+        let mut usr_led = gpioe.pe1.into_push_pull_output(); // LED2
+        usr_led.set_high().ok();
 
         let _rmii_ref_clk = gpioa.pa1.into_alternate_af11().set_speed(VeryHigh);
         let _rmii_mdio = gpioa.pa2.into_alternate_af11().set_speed(VeryHigh);
@@ -165,8 +163,8 @@ const APP: () = {
         let _rmii_rxd0 = gpioc.pc4.into_alternate_af11().set_speed(VeryHigh);
         let _rmii_rxd1 = gpioc.pc5.into_alternate_af11().set_speed(VeryHigh);
         let _rmii_tx_en = gpiog.pg11.into_alternate_af11().set_speed(VeryHigh);
-        let _rmii_txd0 = gpiog.pg12.into_alternate_af11().set_speed(VeryHigh);
-        let _rmii_txd1 = gpiog.pg13.into_alternate_af11().set_speed(VeryHigh);
+        let _rmii_txd0 = gpiog.pg13.into_alternate_af11().set_speed(VeryHigh);
+        let _rmii_txd1 = gpiob.pb13.into_alternate_af11().set_speed(VeryHigh);
 
         // Initialise ethernet...
         assert_eq!(ccdr.clocks.hclk().0, 200_000_000); // HCLK 200MHz
@@ -209,6 +207,7 @@ const APP: () = {
             net,
             lan8742a,
             link_led,
+            usr_led
         }
     }
 
@@ -225,10 +224,10 @@ const APP: () = {
         }
     }
 
-    #[task(binds = ETH, resources = [net])]
+    #[task(binds = ETH, resources = [net, usr_led])]
     fn ethernet_event(ctx: ethernet_event::Context) {
         unsafe { ethernet::interrupt_handler() }
-
+        ctx.resources.usr_led.toggle().unwrap();
         let time = TIME.load(Ordering::Relaxed);
         ctx.resources.net.poll(time as i64);
     }

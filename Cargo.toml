@@ -40,7 +40,7 @@ version = "0.4.11"
 [dependencies.panic-halt]
 version = "0.2.0"
 
-[dependencies.panic-itm]
+[dependecies.panic-itm]
 version = "~0.4.1"
 
 [dependencies.panic-rtt-target]
@@ -63,6 +63,7 @@ default-features = false
 name = "stm32h743zi_playground"
 test = false
 bench = false
+
 
 [profile.release]
 codegen-units = 1 # better optimizations

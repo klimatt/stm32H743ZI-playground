@@ -1,4 +1,4 @@
-#![deny(warnings)]
+//#![deny(warnings)]
 #![no_main]
 #![no_std]
 
@@ -14,9 +14,9 @@ use smoltcp::iface::{
     EthernetInterface, EthernetInterfaceBuilder, Neighbor, NeighborCache,
     Route, Routes,
 };
-use smoltcp::socket::{SocketSet, SocketSetItem};
+use smoltcp::socket::{SocketSet, SocketSetItem, UdpSocket, UdpSocketBuffer, UdpPacketMetadata, TcpSocketBuffer, TcpSocket, SocketHandle, SocketRef};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv6Cidr};
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv6Cidr, IpEndpoint};
 
 use gpio::Speed::*;
 use stm32h7xx_hal::gpio;
@@ -68,6 +68,8 @@ static mut STORE: NetStorageStatic = NetStorageStatic {
 pub struct Net<'a> {
     iface: EthernetInterface<'a, ethernet::EthernetDMA<'a>>,
     sockets: SocketSet<'a>,
+    udp_handle: SocketHandle,
+    tcp_handle: SocketHandle,
 }
 impl<'a> Net<'a> {
     pub fn new(
@@ -89,9 +91,31 @@ impl<'a> Net<'a> {
             .ip_addrs(&mut store.ip_addrs[..])
             .routes(routes)
             .finalize();
-        let sockets = SocketSet::new(&mut store.socket_set_entries[..]);
 
-        return Net { iface, sockets };
+
+        let udp_socket = {
+            static mut UDP_SERVER_RX_DATA: [u8; 128] = [0; 128];
+            static mut UDP_SERVER_TX_DATA: [u8; 128] = [0; 128];
+            static mut UDP_SERVER_RX_METADATA: [PacketMetadata<IpEndpoint>; 1] = [UdpPacketMetadata::EMPTY; 1];
+            static mut UDP_SERVER_TX_METADATA: [PacketMetadata<IpEndpoint>; 1] = [UdpPacketMetadata::EMPTY; 1];
+            let udp_rx_buffer = UdpSocketBuffer::new(unsafe { &mut UDP_SERVER_RX_METADATA[..] },unsafe { &mut UDP_SERVER_RX_DATA[..] });
+            let udp_tx_buffer = UdpSocketBuffer::new(unsafe { &mut UDP_SERVER_TX_METADATA[..] },unsafe { &mut UDP_SERVER_TX_DATA[..] });
+            UdpSocket::new(udp_rx_buffer, udp_tx_buffer)
+        };
+        let tcp_socket = {
+            static mut TCP_SERVER_RX_DATA: [u8; 128] = [0; 128];
+            static mut TCP_SERVER_TX_DATA: [u8; 128] = [0; 128];
+            let tcp_rx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
+            let tcp_tx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
+            TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer)
+        };
+
+
+        let mut sockets = SocketSet::new(&mut store.socket_set_entries[..]);
+        let udp_handle = sockets.add(udp_socket);
+        let tcp_handle = sockets.add(tcp_socket);
+
+        return Net { iface, sockets, udp_handle, tcp_handle };
     }
 
     /// Polls on the ethernet interface. You should refer to the smoltcp
@@ -107,6 +131,8 @@ impl<'a> Net<'a> {
 }
 
 use rtt_target::{rprintln};
+use smoltcp::storage::PacketMetadata;
+use core::fmt::Write;
 
 #[app(device = stm32h7xx_hal::stm32, peripherals = true)]
 const APP: () = {
@@ -198,11 +224,26 @@ const APP: () = {
         rprintln!("enable irq");
         // unsafe: mutable reference to static storage, we only do this once
         let store = unsafe { &mut STORE };
-        let net = Net::new(store, eth_dma, mac_addr);
+        let mut net = Net::new(store, eth_dma, mac_addr);
+
+        {
+            let mut u_s = net.sockets.get::<UdpSocket>(net.udp_handle);
+            if !u_s.is_open() {
+                info!("UDP_Socket: {:?}", u_s.bind(6969));
+            }
+        }
+
+        {
+            let mut t_s = net.sockets.get::<TcpSocket>(net.tcp_handle);
+            if !t_s.is_open() {
+                info!("TCP_Socket: {:?}", t_s.listen(1234));
+            }
+        }
 
         // 1ms tick
         systick_init(ctx.core.SYST, ccdr.clocks);
 
+        net.poll( 0);
         init::LateResources {
             net,
             lan8742a,
@@ -214,8 +255,6 @@ const APP: () = {
     #[idle(resources = [lan8742a, link_led])]
     fn idle(ctx: idle::Context) -> ! {
         loop {
-            // Ethernet
-            //rprintln!("idle");
             match ctx.resources.lan8742a.poll_link() {
                 true => ctx.resources.link_led.set_low(),
                 _ => ctx.resources.link_led.set_high(),
@@ -228,6 +267,51 @@ const APP: () = {
     fn ethernet_event(ctx: ethernet_event::Context) {
         unsafe { ethernet::interrupt_handler() }
         ctx.resources.usr_led.toggle().unwrap();
+        {
+            let mut u_s: SocketRef<UdpSocket> = ctx.resources.net.sockets.get::<UdpSocket>(ctx.resources.net.udp_handle);
+            if u_s.is_open(){
+                let client = match u_s.recv() {
+                    Ok((data, endpoint)) => {
+                        info!("u_rx: {:?}, from: {:?}", data, endpoint);
+                        Some(endpoint)
+                    }
+                    Err(_) => None,
+                };
+                if let Some(endpoint) = client {
+                    let data = b"UDP Hello from STM32H7!\n";
+                    u_s.send_slice(data, endpoint).unwrap();
+                }
+            }
+        }
+        {
+            let mut t_s: SocketRef<TcpSocket> = ctx.resources.net.sockets.get::<TcpSocket>(ctx.resources.net.tcp_handle);
+            if !t_s.is_open() {
+                t_s.listen(1234).unwrap();
+            }
+              if t_s.can_recv() {
+                  match t_s.recv(|buffer| {
+                      info!("t_rx: {:?}", buffer);
+                      let len = buffer.len();
+                      (len, buffer)
+                  }){
+                    Ok(_) => {
+                        if t_s.can_send() {
+                            t_s.write_str("TCP Hello from STM32H7!").unwrap();
+                        }
+                        t_s.close();
+                    }
+                    Err(_) => {}
+                  }
+
+
+
+                  /*if let Some(endpoint) = client {
+                      let data = b"hello from STM32\n";
+                      u_s.send_slice(data, endpoint).unwrap();
+                  }*/
+               }
+        }
+
         let time = TIME.load(Ordering::Relaxed);
         ctx.resources.net.poll(time as i64);
     }

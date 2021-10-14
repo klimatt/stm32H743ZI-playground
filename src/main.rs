@@ -120,11 +120,15 @@ impl<'a> Net<'a> {
 
     /// Polls on the ethernet interface. You should refer to the smoltcp
     /// documentation for poll() to understand how to call poll efficiently
-    pub fn poll(&mut self, now: i64) {
-        let timestamp = Instant::from_millis(now);
+    pub fn poll(&mut self) {
+        let timestamp = Instant::from_millis(TIME.load(Ordering::Relaxed) as i64);
+        let t = match self.iface.poll_at(&mut self.sockets, timestamp) {
+            None => {timestamp}
+            Some(t) => {t}
+        };
 
         self.iface
-            .poll(&mut self.sockets, timestamp)
+            .poll(&mut self.sockets, t)
             .map(|_| ())
             .unwrap_or_else(|e| info!("Poll: {:?}", e));
     }
@@ -225,7 +229,6 @@ const APP: () = {
         // unsafe: mutable reference to static storage, we only do this once
         let store = unsafe { &mut STORE };
         let mut net = Net::new(store, eth_dma, mac_addr);
-
         {
             let mut u_s = net.sockets.get::<UdpSocket>(net.udp_handle);
             if !u_s.is_open() {
@@ -243,7 +246,7 @@ const APP: () = {
         // 1ms tick
         systick_init(ctx.core.SYST, ccdr.clocks);
 
-        net.poll( 0);
+        //net.poll( 0);
         init::LateResources {
             net,
             lan8742a,
@@ -267,12 +270,13 @@ const APP: () = {
     fn ethernet_event(ctx: ethernet_event::Context) {
         unsafe { ethernet::interrupt_handler() }
         ctx.resources.usr_led.toggle().unwrap();
+        ctx.resources.net.poll();
         {
             let mut u_s: SocketRef<UdpSocket> = ctx.resources.net.sockets.get::<UdpSocket>(ctx.resources.net.udp_handle);
             if u_s.is_open(){
                 let client = match u_s.recv() {
                     Ok((data, endpoint)) => {
-                        info!("u_rx: {:?}, from: {:?}", data, endpoint);
+                        //info!("u_rx: {:?}, from: {:?}", data, endpoint);
                         Some(endpoint)
                     }
                     Err(_) => None,
@@ -283,6 +287,7 @@ const APP: () = {
                 }
             }
         }
+        ctx.resources.net.poll();
         {
             let mut t_s: SocketRef<TcpSocket> = ctx.resources.net.sockets.get::<TcpSocket>(ctx.resources.net.tcp_handle);
             if !t_s.is_open() {
@@ -290,7 +295,7 @@ const APP: () = {
             }
               if t_s.can_recv() {
                   match t_s.recv(|buffer| {
-                      info!("t_rx: {:?}", buffer);
+                      //info!("t_rx: {:?}", buffer);
                       let len = buffer.len();
                       (len, buffer)
                   }){
@@ -302,18 +307,9 @@ const APP: () = {
                     }
                     Err(_) => {}
                   }
-
-
-
-                  /*if let Some(endpoint) = client {
-                      let data = b"hello from STM32\n";
-                      u_s.send_slice(data, endpoint).unwrap();
-                  }*/
                }
         }
-
-        let time = TIME.load(Ordering::Relaxed);
-        ctx.resources.net.poll(time as i64);
+        ctx.resources.net.poll();
     }
 
     #[task(binds = SysTick, priority=15)]

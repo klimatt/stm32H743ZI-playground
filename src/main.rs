@@ -15,7 +15,7 @@ use smoltcp::iface::{
     Route, Routes,
 };
 use smoltcp::socket::{SocketSet, SocketSetItem, UdpSocket, UdpSocketBuffer, UdpPacketMetadata, TcpSocketBuffer, TcpSocket, SocketHandle, SocketRef};
-use smoltcp::time::Instant;
+use smoltcp::time::{Instant, Duration};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv6Cidr, IpEndpoint};
 
 use gpio::Speed::*;
@@ -24,7 +24,6 @@ use stm32h7xx_hal::hal::digital::v2::OutputPin;
 use stm32h7xx_hal::rcc::CoreClocks;
 use stm32h7xx_hal::{ethernet, ethernet::PHY};
 use stm32h7xx_hal::{prelude::*, stm32};
-
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use stm32h7xx_hal::hal::digital::v2::ToggleableOutputPin;
@@ -122,13 +121,9 @@ impl<'a> Net<'a> {
     /// documentation for poll() to understand how to call poll efficiently
     pub fn poll(&mut self) {
         let timestamp = Instant::from_millis(TIME.load(Ordering::Relaxed) as i64);
-        let t = match self.iface.poll_at(&mut self.sockets, timestamp) {
-            None => {timestamp}
-            Some(t) => {t}
-        };
 
         self.iface
-            .poll(&mut self.sockets, t)
+            .poll(&mut self.sockets, timestamp)
             .map(|_| ())
             .unwrap_or_else(|e| info!("Poll: {:?}", e));
     }
@@ -236,13 +231,6 @@ const APP: () = {
             }
         }
 
-        {
-            let mut t_s = net.sockets.get::<TcpSocket>(net.tcp_handle);
-            if !t_s.is_open() {
-                info!("TCP_Socket: {:?}", t_s.listen(1234));
-            }
-        }
-
         // 1ms tick
         systick_init(ctx.core.SYST, ccdr.clocks);
 
@@ -287,7 +275,7 @@ const APP: () = {
                 }
             }
         }
-        ctx.resources.net.poll();
+        //ctx.resources.net.poll();
         {
             let mut t_s: SocketRef<TcpSocket> = ctx.resources.net.sockets.get::<TcpSocket>(ctx.resources.net.tcp_handle);
             if !t_s.is_open() {

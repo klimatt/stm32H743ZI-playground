@@ -8,178 +8,107 @@ use rtic::app;
 #[macro_use]
 #[allow(unused)]
 mod utilities;
-use log::info;
+use stm32h7xx_hal::time::Hertz;
+use cortex_m_rt::{ExceptionFrame, exception};
+use core::panic::PanicInfo;
+use core::sync::atomic;
+use core::sync::atomic::Ordering;
+use rtt_target::{rtt_init_print, rprintln};
+use tim_systick_monotonic;
+use rtic::rtic_monotonic::Milliseconds;
+use core::convert::TryFrom;
 
-use smoltcp::iface::{
-    EthernetInterface, EthernetInterfaceBuilder, Neighbor, NeighborCache,
-    Route, Routes,
-};
-use smoltcp::socket::{SocketSet, SocketSetItem, UdpSocket, UdpSocketBuffer, UdpPacketMetadata, TcpSocketBuffer, TcpSocket, SocketHandle, SocketRef};
-use smoltcp::time::{Instant, Duration};
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv6Cidr, IpEndpoint};
+mod network;
 
-use gpio::Speed::*;
-use stm32h7xx_hal::gpio;
-use stm32h7xx_hal::hal::digital::v2::OutputPin;
-use stm32h7xx_hal::rcc::CoreClocks;
-use stm32h7xx_hal::{ethernet, ethernet::PHY};
-use stm32h7xx_hal::{prelude::*, stm32};
-use core::sync::atomic::{AtomicU32, Ordering};
+pub const CLOCKS_FREQ_HZ: u32 = 200_000_000; //200 MHz
+pub type TimMono = tim_systick_monotonic::TimSystickMonotonic<CLOCKS_FREQ_HZ>;
 
-use stm32h7xx_hal::hal::digital::v2::ToggleableOutputPin;
-/// Configure SYSTICK for 1ms timebase
-fn systick_init(mut syst: stm32::SYST, clocks: CoreClocks) {
-    let c_ck_mhz = clocks.c_ck().0 / 1_000_000;
-
-    let syst_calib = 0x3E8;
-
-    syst.set_clock_source(cortex_m::peripheral::syst::SystClkSource::Core);
-    syst.set_reload((syst_calib * c_ck_mhz) - 1);
-    syst.enable_interrupt();
-    syst.enable_counter();
+pub fn time_now() -> Milliseconds {
+    let now: rtic::rtic_monotonic::Instant<TimMono> = app::monotonics::now();
+    Milliseconds::<u32>::try_from(now.duration_since_epoch()).unwrap_or(Milliseconds(0))
 }
 
-/// TIME is an atomic u32 that counts milliseconds.
-static TIME: AtomicU32 = AtomicU32::new(0);
+#[app(device = stm32h7xx_hal::stm32, peripherals = true, dispatchers = [FLASH])]
+mod app {
+    use crate::{rtt_init_print, rprintln};
+    use stm32h7xx_hal::rcc::CoreClocks;
+    use stm32h7xx_hal::{prelude::*, stm32, gpio, pac, ethernet};
+    use embedded_hal::digital::v2::OutputPin;
+    use embedded_hal::digital::v2::ToggleableOutputPin;
+    use rtic::rtic_monotonic::Extensions;
+    use crate::{utilities};
+    use stm32h7xx_hal::time::MegaHertz;
+    use cortex_m::asm::delay;
+    use rtic::Monotonic;
+    use stm32h7xx_hal::gpio::Speed::VeryHigh;
+    use stm32h7xx_hal::ethernet::PHY;
+    use smoltcp::socket::UdpSocket;
+    use crate::network::net;
+    use core::fmt::Write;
 
-/// Locally administered MAC address
-const MAC_ADDRESS: [u8; 6] = [0x02, 0x00, 0x11, 0x22, 0x33, 0x44];
+    type LinkLed = gpio::gpiob::PB0<gpio::Output<gpio::PushPull>>;
+    type EthEventLed = gpio::gpioe::PE1<gpio::Output<gpio::PushPull>>;
+    type SystemLed = gpio::gpiob::PB14<gpio::Output<gpio::PushPull>>;
 
-/// Ethernet descriptor rings are a global singleton
-#[link_section = ".sram3.eth"]
-static mut DES_RING: ethernet::DesRing = ethernet::DesRing::new();
+    #[monotonic(binds = SysTick, default = true)]
+    type MyMono = crate::TimMono;
 
-/// Net storage with static initialisation - another global singleton
-pub struct NetStorageStatic<'a> {
-    ip_addrs: [IpCidr; 1],
-    socket_set_entries: [Option<SocketSetItem<'a>>; 8],
-    neighbor_cache_storage: [Option<(IpAddress, Neighbor)>; 8],
-    routes_storage: [Option<(IpCidr, Route)>; 1],
-}
-static mut STORE: NetStorageStatic = NetStorageStatic {
-    // Garbage
-    ip_addrs: [IpCidr::Ipv6(Ipv6Cidr::SOLICITED_NODE_PREFIX)],
-    socket_set_entries: [None, None, None, None, None, None, None, None],
-    neighbor_cache_storage: [None; 8],
-    routes_storage: [None; 1],
-};
-
-pub struct Net<'a> {
-    iface: EthernetInterface<'a, ethernet::EthernetDMA<'a>>,
-    sockets: SocketSet<'a>,
-    udp_handle: SocketHandle,
-    tcp_handle: SocketHandle,
-}
-impl<'a> Net<'a> {
-    pub fn new(
-        store: &'static mut NetStorageStatic<'a>,
-        ethdev: ethernet::EthernetDMA<'a>,
-        ethernet_addr: EthernetAddress,
-    ) -> Self {
-        // Set IP address
-        store.ip_addrs =
-            [IpCidr::new(IpAddress::v4(192, 168, 1, 10).into(), 0)];
-
-        let neighbor_cache =
-            NeighborCache::new(&mut store.neighbor_cache_storage[..]);
-        let routes = Routes::new(&mut store.routes_storage[..]);
-
-        let iface = EthernetInterfaceBuilder::new(ethdev)
-            .ethernet_addr(ethernet_addr)
-            .neighbor_cache(neighbor_cache)
-            .ip_addrs(&mut store.ip_addrs[..])
-            .routes(routes)
-            .finalize();
-
-
-        let udp_socket = {
-            static mut UDP_SERVER_RX_DATA: [u8; 128] = [0; 128];
-            static mut UDP_SERVER_TX_DATA: [u8; 128] = [0; 128];
-            static mut UDP_SERVER_RX_METADATA: [PacketMetadata<IpEndpoint>; 1] = [UdpPacketMetadata::EMPTY; 1];
-            static mut UDP_SERVER_TX_METADATA: [PacketMetadata<IpEndpoint>; 1] = [UdpPacketMetadata::EMPTY; 1];
-            let udp_rx_buffer = UdpSocketBuffer::new(unsafe { &mut UDP_SERVER_RX_METADATA[..] },unsafe { &mut UDP_SERVER_RX_DATA[..] });
-            let udp_tx_buffer = UdpSocketBuffer::new(unsafe { &mut UDP_SERVER_TX_METADATA[..] },unsafe { &mut UDP_SERVER_TX_DATA[..] });
-            UdpSocket::new(udp_rx_buffer, udp_tx_buffer)
-        };
-        let tcp_socket = {
-            static mut TCP_SERVER_RX_DATA: [u8; 128] = [0; 128];
-            static mut TCP_SERVER_TX_DATA: [u8; 128] = [0; 128];
-            let tcp_rx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_SERVER_RX_DATA[..] });
-            let tcp_tx_buffer = TcpSocketBuffer::new(unsafe { &mut TCP_SERVER_TX_DATA[..] });
-            TcpSocket::new(tcp_rx_buffer, tcp_tx_buffer)
-        };
-
-
-        let mut sockets = SocketSet::new(&mut store.socket_set_entries[..]);
-        let udp_handle = sockets.add(udp_socket);
-        let tcp_handle = sockets.add(tcp_socket);
-
-        return Net { iface, sockets, udp_handle, tcp_handle };
-    }
-
-    /// Polls on the ethernet interface. You should refer to the smoltcp
-    /// documentation for poll() to understand how to call poll efficiently
-    pub fn poll(&mut self) {
-        let timestamp = Instant::from_millis(TIME.load(Ordering::Relaxed) as i64);
-
-        self.iface
-            .poll(&mut self.sockets, timestamp)
-            .map(|_| ())
-            .unwrap_or_else(|e| info!("Poll: {:?}", e));
-    }
-}
-
-use rtt_target::{rprintln};
-use smoltcp::storage::PacketMetadata;
-use core::fmt::Write;
-
-#[app(device = stm32h7xx_hal::stm32, peripherals = true)]
-const APP: () = {
-    struct Resources {
-        net: Net<'static>,
+    #[local]
+    struct Local {
+        link_led: LinkLed,
+        eth_led: EthEventLed,
+        sys_led: SystemLed,
         lan8742a: ethernet::phy::LAN8742A<ethernet::EthernetMAC>,
-        link_led: gpio::gpiob::PB0<gpio::Output<gpio::PushPull>>,
-        usr_led: gpio::gpioe::PE1<gpio::Output<gpio::PushPull>>,
+    }
+    #[shared]
+    struct Shared {
+        network: net::Net<'static>,
     }
 
     #[init]
-    fn init(mut ctx: init::Context) -> init::LateResources {
-        utilities::logger::init();
-        //rtt_init_print!();
-        rprintln!("Start");
-        info!("Start               ");
-        // Initialise power...
-        let pwr = ctx.device.PWR.constrain();
+    fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
+        rtt_init_print!();
+        let mut dp: pac::Peripherals = cx.device;
+        let pwr = dp.PWR.constrain();
         let pwrcfg = example_power!(pwr).freeze();
-        //rprintln!("Pwr Init");
+
         // Link the SRAM3 power state to CPU1
-        ctx.device.RCC.ahb2enr.modify(|_, w| w.sram3en().set_bit());
+        dp.RCC.ahb2enr.modify(|_, w| w.sram3en().set_bit());
 
         // Initialise clocks...
-        let rcc = ctx.device.RCC.constrain();
+        let rcc = dp.RCC.constrain();
         let ccdr = rcc
-            .sys_ck(200.mhz())
-            .hclk(200.mhz())
-            .freeze(pwrcfg, &ctx.device.SYSCFG);
+            .sys_ck(crate::CLOCKS_FREQ_HZ.hz())
+            .hclk(crate::CLOCKS_FREQ_HZ.hz())
+            .freeze(pwrcfg, &dp.SYSCFG);
 
-        // Initialise system...
-        ctx.core.SCB.enable_icache();
-        // TODO: ETH DMA coherence issues
-        // ctx.core.SCB.enable_dcache(&mut ctx.core.CPUID);
-        ctx.core.DWT.enable_cycle_counter();
+        // Initialise ethernet...
+        assert_eq!(ccdr.clocks.hclk().0, 200_000_000); // HCLK 200MHz
+        assert_eq!(ccdr.clocks.pclk1().0, 100_000_000); // PCLK 100MHz
+        assert_eq!(ccdr.clocks.pclk2().0, 100_000_000); // PCLK 100MHz
+        assert_eq!(ccdr.clocks.pclk4().0, 100_000_000); // PCLK 100MHz
 
-        // Initialise IO...
-        let gpioa = ctx.device.GPIOA.split(ccdr.peripheral.GPIOA);
-        let gpiob = ctx.device.GPIOB.split(ccdr.peripheral.GPIOB);
-        let gpioc = ctx.device.GPIOC.split(ccdr.peripheral.GPIOC);
-        let gpiog = ctx.device.GPIOG.split(ccdr.peripheral.GPIOG);
-        let gpioe = ctx.device.GPIOE.split(ccdr.peripheral.GPIOE);
-        //let gpioi = ctx.device.GPIOI.split(ccdr.peripheral.GPIOI);
-        let mut link_led = gpiob.pb0.into_push_pull_output(); // LED3
+        let mut core: cortex_m::Peripherals = cx.core;
+        core.SCB.enable_icache();
+        core.DWT.enable_cycle_counter();
+
+        let systick = core.SYST;
+        let mono = tim_systick_monotonic::TimSystickMonotonic::new(systick, dp.TIM15, dp.TIM17, crate::CLOCKS_FREQ_HZ);
+
+        let gpioa = dp.GPIOA.split(ccdr.peripheral.GPIOA);
+        let gpiob = dp.GPIOB.split(ccdr.peripheral.GPIOB);
+        let gpioc = dp.GPIOC.split(ccdr.peripheral.GPIOC);
+        let gpiog = dp.GPIOG.split(ccdr.peripheral.GPIOG);
+        let gpioe = dp.GPIOE.split(ccdr.peripheral.GPIOE);
+
+        let mut link_led: LinkLed = gpiob.pb0.into_push_pull_output();
         link_led.set_high().ok();
 
-        let mut usr_led = gpioe.pe1.into_push_pull_output(); // LED2
-        usr_led.set_high().ok();
+        let mut eth_led: EthEventLed = gpioe.pe1.into_push_pull_output();
+        eth_led.set_high().ok();
+
+        let mut sys_led: SystemLed = gpiob.pb14.into_push_pull_output();
+        sys_led.set_high().ok();
 
         let _rmii_ref_clk = gpioa.pa1.into_alternate_af11().set_speed(VeryHigh);
         let _rmii_mdio = gpioa.pa2.into_alternate_af11().set_speed(VeryHigh);
@@ -191,20 +120,13 @@ const APP: () = {
         let _rmii_txd0 = gpiog.pg13.into_alternate_af11().set_speed(VeryHigh);
         let _rmii_txd1 = gpiob.pb13.into_alternate_af11().set_speed(VeryHigh);
 
-        // Initialise ethernet...
-        assert_eq!(ccdr.clocks.hclk().0, 200_000_000); // HCLK 200MHz
-        assert_eq!(ccdr.clocks.pclk1().0, 100_000_000); // PCLK 100MHz
-        assert_eq!(ccdr.clocks.pclk2().0, 100_000_000); // PCLK 100MHz
-        assert_eq!(ccdr.clocks.pclk4().0, 100_000_000); // PCLK 100MHz
-
-        rprintln!("Mac adddr");
-        let mac_addr = smoltcp::wire::EthernetAddress::from_bytes(&MAC_ADDRESS);
+        let mac_addr = smoltcp::wire::EthernetAddress::from_bytes(&net::config::MAC_ADDRESS);
         let (eth_dma, eth_mac) = unsafe {
             ethernet::new_unchecked(
-                ctx.device.ETHERNET_MAC,
-                ctx.device.ETHERNET_MTL,
-                ctx.device.ETHERNET_DMA,
-                &mut DES_RING,
+                dp.ETHERNET_MAC,
+                dp.ETHERNET_MTL,
+                dp.ETHERNET_DMA,
+                &mut net::DES_RING,
                 mac_addr.clone(),
                 ccdr.peripheral.ETH1MAC,
                 &ccdr.clocks,
@@ -222,86 +144,103 @@ const APP: () = {
         }
         rprintln!("enable irq");
         // unsafe: mutable reference to static storage, we only do this once
-        let store = unsafe { &mut STORE };
-        let mut net = Net::new(store, eth_dma, mac_addr);
-        {
-            let mut u_s = net.sockets.get::<UdpSocket>(net.udp_handle);
-            if !u_s.is_open() {
-                info!("UDP_Socket: {:?}", u_s.bind(6969));
-            }
-        }
+        let store = unsafe { &mut net::STORE };
+        let mut network = net::Net::new(store, eth_dma, mac_addr);
 
-        // 1ms tick
-        systick_init(ctx.core.SYST, ccdr.clocks);
 
-        //net.poll( 0);
-        init::LateResources {
-            net,
-            lan8742a,
-            link_led,
-            usr_led
-        }
+        link_led.set_low().ok();
+        eth_led.set_low().ok();
+        sys_led.set_low().ok();
+
+        sys_led_blink::spawn_after(1.seconds()).unwrap();
+        (
+            Shared {
+                network,
+            },
+            Local {
+                link_led,
+                eth_led,
+                sys_led,
+                lan8742a
+            },
+            init::Monotonics(mono)
+        )
     }
 
-    #[idle(resources = [lan8742a, link_led])]
-    fn idle(ctx: idle::Context) -> ! {
+    #[task(local = [sys_led])]
+    fn sys_led_blink(cx: sys_led_blink::Context) {
+        cx.local.sys_led.toggle().ok();
+        sys_led_blink::spawn_after(1.seconds()).unwrap();
+    }
+
+    /*#[task(shared = [network])]
+    fn try_poll_task(mut cx: try_poll_task::Context) {
+        let now: rtic::rtic_monotonic::Instant<crate::TimMono> = monotonics::now();
+        let now = Milliseconds::<u32>::try_from(now.duration_since_epoch()).unwrap_or(Milliseconds(0));
+        cx.shared.network.lock(|n|{
+            match n.try_poll(now.0 as i64) {
+                Ok(_) => {
+                    n.poll(now.0 as i64);
+                }
+                Err(duration) => {
+                    try_poll_task::spawn_after((duration.millis() as u32).milliseconds()).unwrap();
+                }
+            }
+        });
+    }*/
+
+    #[idle(local = [link_led, lan8742a])]
+    fn idle(cx: idle::Context) -> ! {
         loop {
-            match ctx.resources.lan8742a.poll_link() {
-                true => ctx.resources.link_led.set_low(),
-                _ => ctx.resources.link_led.set_high(),
+            match cx.local.lan8742a.poll_link() {
+                true =>  cx.local.link_led.set_low(),
+                _ => cx.local.link_led.set_high(),
             }
                 .ok();
         }
     }
 
-    #[task(binds = ETH, resources = [net, usr_led])]
-    fn ethernet_event(ctx: ethernet_event::Context) {
+    #[task(binds = ETH, shared = [network], local = [eth_led])]
+    fn ethernet_event(mut cx: ethernet_event::Context) {
         unsafe { ethernet::interrupt_handler() }
-        ctx.resources.usr_led.toggle().unwrap();
-        ctx.resources.net.poll();
-        {
-            let mut u_s: SocketRef<UdpSocket> = ctx.resources.net.sockets.get::<UdpSocket>(ctx.resources.net.udp_handle);
-            if u_s.is_open(){
-                let client = match u_s.recv() {
-                    Ok((data, endpoint)) => {
-                        //info!("u_rx: {:?}, from: {:?}", data, endpoint);
-                        Some(endpoint)
+        cx.local.eth_led.toggle().unwrap();
+        cx.shared.network.lock(|n|{
+            n.poll(crate::time_now().0 as i64);
+            {
+                let mut t_s: net::SocketRef<net::TcpSocket> = n.sockets.get::<net::TcpSocket>(n.tcp_handle);
+                if !t_s.is_open() {
+                    t_s.listen(1234).unwrap();
+                }
+                if t_s.may_recv() {
+                    let data = t_s.recv(|buffer| {
+                        let len = buffer.len();
+                        let mut data: [u8; net::config::TCP_SERVER_RX_SIZE] = [0; net::config::TCP_SERVER_RX_SIZE];
+                        data[0..len].copy_from_slice(&buffer[0..len]);
+                        (len, (data, len))
+                    }).unwrap();
+                    if t_s.can_send() {
+                        t_s.send_slice(&data.0[0..data.1]).unwrap();
                     }
-                    Err(_) => None,
-                };
-                if let Some(endpoint) = client {
-                    let data = b"UDP Hello from STM32H7!\n";
-                    u_s.send_slice(data, endpoint).unwrap();
+                }
+                else if t_s.may_send() {
+                    t_s.close();
                 }
             }
-        }
-        //ctx.resources.net.poll();
-        {
-            let mut t_s: SocketRef<TcpSocket> = ctx.resources.net.sockets.get::<TcpSocket>(ctx.resources.net.tcp_handle);
-            if !t_s.is_open() {
-                t_s.listen(1234).unwrap();
-            }
-              if t_s.can_recv() {
-                  match t_s.recv(|buffer| {
-                      //info!("t_rx: {:?}", buffer);
-                      let len = buffer.len();
-                      (len, buffer)
-                  }){
-                    Ok(_) => {
-                        if t_s.can_send() {
-                            t_s.write_str("TCP Hello from STM32H7!").unwrap();
-                        }
-                        t_s.close();
-                    }
-                    Err(_) => {}
-                  }
-               }
-        }
-        ctx.resources.net.poll();
+            n.poll(crate::time_now().0 as i64)
+        });
     }
+}
 
-    #[task(binds = SysTick, priority=15)]
-    fn systick_tick(_: systick_tick::Context) {
-        TIME.fetch_add(1, Ordering::Relaxed);
+#[exception]
+fn HardFault(ef: &ExceptionFrame) -> ! {
+    panic!("{:#?}", ef);
+}
+
+#[inline(never)]
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    rprintln!("Panic {:?}", _info);
+    loop {
+        atomic::compiler_fence(Ordering::SeqCst);
     }
-};
+}

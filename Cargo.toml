@@ -6,7 +6,7 @@ name = "stm32h743zi_playground"
 version = "0.1.0"
 
 [dependencies]
-stm32h7xx-hal = {version = "0.10.0", features = ["stm32h743", "rt", "log-rtt", "ethernet"]}
+stm32h7xx-hal = {version = "0.10.0", features = ["stm32h743v", "rt", "log-rtt", "ethernet"]}
 
 [dependencies.embedded-hal]
 version = "0.2.4"
@@ -25,7 +25,7 @@ version = "~0.7.0"
 features = ["itm", "semihosting", "log-integration"]
 
 [dependencies.cortex-m-rtic]
-version = "0.5.3"
+version = "0.6.0-rc.2"
 
 [dependencies.cortex-m-semihosting]
 version = "0.3.5"
@@ -37,18 +37,15 @@ features = ["spin_no_std"]
 [dependencies.log]
 version = "0.4.11"
 
-[dependencies.panic-halt]
-version = "0.2.0"
-
 [dependecies.panic-itm]
 version = "~0.4.1"
 
-[dependencies.panic-rtt-target]
-version = "0.1.0"
-features = ["cortex-m"]
+#[dependencies.panic-rtt-target]
+#version = "0.1.0"
+#features = ["cortex-m"]
 
 [dependencies.rtt-target]
-version = "0.2.0"
+version = "0.2.2"
 features = ["cortex-m"]
 
 [dependencies.smoltcp]
@@ -56,6 +53,13 @@ version = "0.7.0"
 features = ["ethernet", "proto-ipv4", "proto-ipv6", "socket-raw",  "socket-udp", "socket-tcp"]
 default-features = false
 
+[dependencies.tim-systick-monotonic]
+path = "../tim-systick-monotonic"
+features = ["h743v-tim15-tim17"]
+
+#[dependencies.dwt-systick-monotonic]
+#ersion = "0.1.0-rc.1"
+#path = "../dwt-systick-monotonic"
 #[patch."https://github.com/vhrdtech/vhrd-module-nvconfig.git"]
 #vhrd-module-nvconfig = { path = "../vhrd-module-nvconfig" }
 

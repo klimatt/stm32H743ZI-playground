@@ -11,6 +11,7 @@ use rtt_target::{rprintln};
 use core::borrow::{Borrow, BorrowMut};
 
 pub use crate::network::config;
+use smoltcp::Error;
 
 /// Ethernet descriptor rings are a global singleton
 #[link_section = ".sram3.eth"]
@@ -86,13 +87,13 @@ impl<'a> Net<'a> {
 
     /// Polls on the ethernet interface. You should refer to the smoltcp
     /// documentation for poll() to understand how to call poll efficiently
-    pub fn poll(&mut self, time_now: i64) {
+    pub fn poll(&mut self, time_now: i64) -> Result<(), Error>{
         let timestamp = Instant::from_millis(time_now);
 
         self.iface
             .poll(&mut self.sockets, timestamp)
             .map(|_| ())
-            .unwrap_or_else(|e| rprintln!("Poll: {:?}", e));
+            //.unwrap_or_else(|e| rprintln!("Poll: {:?}", e));
     }
 
     /*pub fn try_poll(&mut self, time_now: i64) -> Result<(), Duration>{

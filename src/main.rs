@@ -63,6 +63,7 @@ mod app {
     #[shared]
     struct Shared {
         network: net::Net<'static>,
+        rx_bytes: u32,
     }
 
     #[init]
@@ -156,6 +157,7 @@ mod app {
         (
             Shared {
                 network,
+                rx_bytes: 0
             },
             Local {
                 link_led,
@@ -167,9 +169,15 @@ mod app {
         )
     }
 
-    #[task(local = [sys_led])]
-    fn sys_led_blink(cx: sys_led_blink::Context) {
+    #[task(local = [sys_led], shared = [rx_bytes])]
+    fn sys_led_blink(mut cx: sys_led_blink::Context) {
         cx.local.sys_led.toggle().ok();
+        let b = cx.shared.rx_bytes.lock(|b| {
+            let res = b.clone();
+            *b = 0;
+            res
+        });
+        rprintln!("{} Mbps", (b * 8) / 1_048_576);
         sys_led_blink::spawn_after(1.seconds()).unwrap();
     }
 
@@ -200,20 +208,29 @@ mod app {
         }
     }
 
-    #[task(binds = ETH, shared = [network], local = [eth_led])]
+    #[task(binds = ETH, shared = [network, rx_bytes], local = [eth_led], priority = 5)]
     fn ethernet_event(mut cx: ethernet_event::Context) {
         unsafe { ethernet::interrupt_handler() }
         cx.local.eth_led.toggle().unwrap();
+        let mut rx_len = 0u32;
         cx.shared.network.lock(|n|{
-            n.poll(crate::time_now().0 as i64);
+            match n.poll(crate::time_now().0 as i64){
+                Ok(_) => {}
+                Err(e) => {
+                    let mut t_s: net::SocketRef<net::TcpSocket> = n.sockets.get::<net::TcpSocket>(n.tcp_handle);
+                    t_s.close();
+                }
+            };
             {
                 let mut t_s: net::SocketRef<net::TcpSocket> = n.sockets.get::<net::TcpSocket>(n.tcp_handle);
                 if !t_s.is_open() {
+                    //t_s.close();
                     t_s.listen(1234).unwrap();
                 }
                 if t_s.may_recv() {
                     let data = t_s.recv(|buffer| {
                         let len = buffer.len();
+                        rx_len = len as u32;
                         let mut data: [u8; net::config::TCP_SERVER_RX_SIZE] = [0; net::config::TCP_SERVER_RX_SIZE];
                         data[0..len].copy_from_slice(&buffer[0..len]);
                         (len, (data, len))
@@ -223,10 +240,21 @@ mod app {
                     }
                 }
                 else if t_s.may_send() {
+                    //t_s.close();
+                }
+                //t_s.state()
+               // t_s.set_keep_alive()
+            }
+            match n.poll(crate::time_now().0 as i64){
+                Ok(_) => {}
+                Err(e) => {
+                    let mut t_s: net::SocketRef<net::TcpSocket> = n.sockets.get::<net::TcpSocket>(n.tcp_handle);
                     t_s.close();
                 }
-            }
-            n.poll(crate::time_now().0 as i64)
+            };
+        });
+        cx.shared.rx_bytes.lock(|b| {
+            *b += rx_len;
         });
     }
 }

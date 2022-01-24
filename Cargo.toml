@@ -57,6 +57,19 @@ default-features = false
 path = "../tim-systick-monotonic"
 features = ["h743v-tim15-tim17"]
 
+[dependencies.embedded-websocket]
+path = "../embedded-websocket"
+default-features = false
+#version = "0.8.0"
+
+[dependencies.bbqueue]
+version = "0.5.0"
+
+[dependencies.httparse]
+version = "1.5.1"
+default-features = false
+
+#default-features = false
 #[dependencies.dwt-systick-monotonic]
 #ersion = "0.1.0-rc.1"
 #path = "../dwt-systick-monotonic"

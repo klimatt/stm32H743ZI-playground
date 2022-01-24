@@ -28,7 +28,7 @@ pub fn time_now() -> Milliseconds {
     Milliseconds::<u32>::try_from(now.duration_since_epoch()).unwrap_or(Milliseconds(0))
 }
 
-#[app(device = stm32h7xx_hal::stm32, peripherals = true, dispatchers = [FLASH])]
+#[app(device = stm32h7xx_hal::stm32, peripherals = true, dispatchers = [FLASH, EXTI1])]
 mod app {
     use crate::{rtt_init_print, rprintln};
     use stm32h7xx_hal::rcc::CoreClocks;
@@ -44,7 +44,12 @@ mod app {
     use stm32h7xx_hal::ethernet::PHY;
     use smoltcp::socket::UdpSocket;
     use crate::network::net;
+    use crate::network::websocket;
     use core::fmt::Write;
+    use embedded_websocket::{WebSocketServer, EmptyRng, Server, Error};
+    use bbqueue::{BBBuffer, Consumer, Producer};
+    use crate::network::websocket::{WebSocketContext, ROOT_HTML};
+    use core::option::Option;
 
     type LinkLed = gpio::gpiob::PB0<gpio::Output<gpio::PushPull>>;
     type EthEventLed = gpio::gpioe::PE1<gpio::Output<gpio::PushPull>>;
@@ -59,6 +64,8 @@ mod app {
         eth_led: EthEventLed,
         sys_led: SystemLed,
         lan8742a: ethernet::phy::LAN8742A<ethernet::EthernetMAC>,
+        cons: Consumer<'static, {net::config::WEB_SOCKET_BUFFER_SIZE}>,
+        prod: Producer<'static, {net::config::WEB_SOCKET_BUFFER_SIZE}>,
     }
     #[shared]
     struct Shared {
@@ -68,6 +75,9 @@ mod app {
 
     #[init]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
+
+        static WEB_SOCKET_BUFFER: BBBuffer<{ net::config::WEB_SOCKET_BUFFER_SIZE }> = BBBuffer::new();
+
         rtt_init_print!();
         let mut dp: pac::Peripherals = cx.device;
         let pwr = dp.PWR.constrain();
@@ -148,6 +158,7 @@ mod app {
         let store = unsafe { &mut net::STORE };
         let mut network = net::Net::new(store, eth_dma, mac_addr);
 
+        let (prod, cons) = WEB_SOCKET_BUFFER.try_split().unwrap();
 
         link_led.set_low().ok();
         eth_led.set_low().ok();
@@ -163,7 +174,9 @@ mod app {
                 link_led,
                 eth_led,
                 sys_led,
-                lan8742a
+                lan8742a,
+                cons,
+                prod
             },
             init::Monotonics(mono)
         )
@@ -208,11 +221,62 @@ mod app {
         }
     }
 
-    #[task(binds = ETH, shared = [network, rx_bytes], local = [eth_led], priority = 5)]
+    #[task(local = [cons], priority = 4)]
+    fn w_s_processor(mut cx: w_s_processor::Context) {
+        match cx.local.cons.split_read() {
+            Err(_) => {},
+            Ok(rgr) => {
+                let (s1, s2) = rgr.bufs();
+                let len = s1.len() + s2.len();
+                let mut tmp = [0u8; net::config::WEB_SOCKET_BUFFER_SIZE];
+                tmp[0..s1.len()].copy_from_slice(s1);
+                tmp[s1.len()..s1.len() + s2.len()].copy_from_slice(s2);
+                //parse(&tmp[0..(s1.len() + s2.len())])
+                rprintln!("buffer: {}", len);
+                //rgr.release(len);
+                let mut headers = [httparse::EMPTY_HEADER; 16];
+                let mut request = httparse::Request::new(&mut headers);
+                let ws_option = match request
+                    .parse(&tmp[0..(s1.len() + s2.len())])
+                    .unwrap()
+                {
+                    httparse::Status::Complete(len) => {
+                        // if we read exactly the right amount of bytes for the HTTP header then read_cursor would be 0
+                        //*read_cursor += received_size - len;
+                        let headers = request.headers.iter().map(|f| (f.name, f.value));
+                        match embedded_websocket::read_http_header(headers) {
+                            Ok(ws) => {
+                                match ws {
+                                    None => {rprintln!("No Context: ");
+                                    None
+                                    }
+                                    Some(ws) => {
+                                        rprintln!("ws context: {:?}", ws.sec_websocket_key);
+                                        Some(ws)
+                                    }
+                                }
+                            }
+                            Err(_) => { rprintln!("Err: ");
+                            None}
+                        }
+                    }
+                    httparse::Status::Partial => { rprintln!("Part: ");
+                    None
+                    }
+                };
+                rgr.release(len);
+
+
+            }
+        }
+    }
+
+    #[task(binds = ETH, shared = [network, rx_bytes], local = [eth_led, prod], priority = 5)]
     fn ethernet_event(mut cx: ethernet_event::Context) {
         unsafe { ethernet::interrupt_handler() }
         cx.local.eth_led.toggle().unwrap();
         let mut rx_len = 0u32;
+        let mut prod = cx.local.prod;
         cx.shared.network.lock(|n|{
             match n.poll(crate::time_now().0 as i64){
                 Ok(_) => {}
@@ -231,19 +295,29 @@ mod app {
                     let data = t_s.recv(|buffer| {
                         let len = buffer.len();
                         rx_len = len as u32;
+                        match prod.grant_exact(len){
+                            Ok(mut wgr) => {
+                                wgr.copy_from_slice(buffer);
+                                wgr.commit(buffer.len());
+                            }
+                            Err(_) => {},
+                        }
+
                         let mut data: [u8; net::config::TCP_SERVER_RX_SIZE] = [0; net::config::TCP_SERVER_RX_SIZE];
                         data[0..len].copy_from_slice(&buffer[0..len]);
                         (len, (data, len))
                     }).unwrap();
                     if t_s.can_send() {
-                        t_s.send_slice(&data.0[0..data.1]).unwrap();
+                        //t_s.send_slice(&data.0[0..data.1]).unwrap();
+                        //t_s.write_str(ROOT_HTML).unwrap();
+                        t_s.send_slice(ROOT_HTML.as_bytes()).unwrap();
                     }
                 }
                 else if t_s.may_send() {
                     //t_s.close();
                 }
                 //t_s.state()
-               // t_s.set_keep_alive()
+                // t_s.set_keep_alive()
             }
             match n.poll(crate::time_now().0 as i64){
                 Ok(_) => {}
@@ -252,6 +326,7 @@ mod app {
                     t_s.close();
                 }
             };
+            w_s_processor::spawn();
         });
         cx.shared.rx_bytes.lock(|b| {
             *b += rx_len;

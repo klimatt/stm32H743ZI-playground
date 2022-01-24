@@ -10,8 +10,10 @@ use smoltcp::storage::PacketMetadata;
 use rtt_target::{rprintln};
 use core::borrow::{Borrow, BorrowMut};
 
+
+
 pub use crate::network::config;
-use smoltcp::Error;
+pub use smoltcp::Error;
 
 /// Ethernet descriptor rings are a global singleton
 #[link_section = ".sram3.eth"]

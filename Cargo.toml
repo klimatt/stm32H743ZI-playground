@@ -54,7 +54,7 @@ features = ["ethernet", "proto-ipv4", "proto-ipv6", "socket-raw",  "socket-udp",
 default-features = false
 
 [dependencies.tim-systick-monotonic]
-path = "../tim-systick-monotonic"
+version = "0.2.0"
 features = ["h743v-tim15-tim17"]
 
 [dependencies.embedded-websocket]

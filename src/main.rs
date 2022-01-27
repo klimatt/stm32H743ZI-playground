@@ -44,12 +44,15 @@ mod app {
     use stm32h7xx_hal::ethernet::PHY;
     use smoltcp::socket::UdpSocket;
     use crate::network::net;
-    use crate::network::websocket;
+    use crate::network::bare_metal_websocket;
     use core::fmt::Write;
     use embedded_websocket::{WebSocketServer, EmptyRng, Server, Error};
     use bbqueue::{BBBuffer, Consumer, Producer};
-    use crate::network::websocket::{WebSocketContext, ROOT_HTML};
+    use crate::network::bare_metal_websocket::{WebSocketContext, ROOT_HTML, BMWSError, HeaderError, FrameResult};
     use core::option::Option;
+    use crate::network::bare_metal_websocket::BMWSState::NotConnected;
+    use embedded_websocket::framer::ReadResult;
+    use core::borrow::BorrowMut;
 
     type LinkLed = gpio::gpiob::PB0<gpio::Output<gpio::PushPull>>;
     type EthEventLed = gpio::gpioe::PE1<gpio::Output<gpio::PushPull>>;
@@ -64,8 +67,9 @@ mod app {
         eth_led: EthEventLed,
         sys_led: SystemLed,
         lan8742a: ethernet::phy::LAN8742A<ethernet::EthernetMAC>,
-        cons: Consumer<'static, {net::config::WEB_SOCKET_BUFFER_SIZE}>,
-        prod: Producer<'static, {net::config::WEB_SOCKET_BUFFER_SIZE}>,
+        cons: Consumer<'static, {net::config::WEB_SOCK_SERVER_BUFFER_SIZE }>,
+        prod: Producer<'static, {net::config::WEB_SOCK_SERVER_BUFFER_SIZE }>,
+        bws: crate::network::bare_metal_websocket::BareMetalWebSocketServer,
     }
     #[shared]
     struct Shared {
@@ -76,7 +80,7 @@ mod app {
     #[init]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
 
-        static WEB_SOCKET_BUFFER: BBBuffer<{ net::config::WEB_SOCKET_BUFFER_SIZE }> = BBBuffer::new();
+        static WEB_SOCKET_BUFFER: BBBuffer<{ net::config::WEB_SOCK_SERVER_BUFFER_SIZE }> = BBBuffer::new();
 
         rtt_init_print!();
         let mut dp: pac::Peripherals = cx.device;
@@ -176,7 +180,8 @@ mod app {
                 sys_led,
                 lan8742a,
                 cons,
-                prod
+                prod,
+                bws: crate::network::bare_metal_websocket::BareMetalWebSocketServer::new(),
             },
             init::Monotonics(mono)
         )
@@ -190,25 +195,9 @@ mod app {
             *b = 0;
             res
         });
-        rprintln!("{} Mbps", (b * 8) / 1_048_576);
+        //rprintln!("{} Mbps", (b * 8) / 1_048_576);
         sys_led_blink::spawn_after(1.seconds()).unwrap();
     }
-
-    /*#[task(shared = [network])]
-    fn try_poll_task(mut cx: try_poll_task::Context) {
-        let now: rtic::rtic_monotonic::Instant<crate::TimMono> = monotonics::now();
-        let now = Milliseconds::<u32>::try_from(now.duration_since_epoch()).unwrap_or(Milliseconds(0));
-        cx.shared.network.lock(|n|{
-            match n.try_poll(now.0 as i64) {
-                Ok(_) => {
-                    n.poll(now.0 as i64);
-                }
-                Err(duration) => {
-                    try_poll_task::spawn_after((duration.millis() as u32).milliseconds()).unwrap();
-                }
-            }
-        });
-    }*/
 
     #[idle(local = [link_led, lan8742a])]
     fn idle(cx: idle::Context) -> ! {
@@ -221,62 +210,13 @@ mod app {
         }
     }
 
-    #[task(local = [cons], priority = 4)]
-    fn w_s_processor(mut cx: w_s_processor::Context) {
-        match cx.local.cons.split_read() {
-            Err(_) => {},
-            Ok(rgr) => {
-                let (s1, s2) = rgr.bufs();
-                let len = s1.len() + s2.len();
-                let mut tmp = [0u8; net::config::WEB_SOCKET_BUFFER_SIZE];
-                tmp[0..s1.len()].copy_from_slice(s1);
-                tmp[s1.len()..s1.len() + s2.len()].copy_from_slice(s2);
-                //parse(&tmp[0..(s1.len() + s2.len())])
-                rprintln!("buffer: {}", len);
-                //rgr.release(len);
-                let mut headers = [httparse::EMPTY_HEADER; 16];
-                let mut request = httparse::Request::new(&mut headers);
-                let ws_option = match request
-                    .parse(&tmp[0..(s1.len() + s2.len())])
-                    .unwrap()
-                {
-                    httparse::Status::Complete(len) => {
-                        // if we read exactly the right amount of bytes for the HTTP header then read_cursor would be 0
-                        //*read_cursor += received_size - len;
-                        let headers = request.headers.iter().map(|f| (f.name, f.value));
-                        match embedded_websocket::read_http_header(headers) {
-                            Ok(ws) => {
-                                match ws {
-                                    None => {rprintln!("No Context: ");
-                                    None
-                                    }
-                                    Some(ws) => {
-                                        rprintln!("ws context: {:?}", ws.sec_websocket_key);
-                                        Some(ws)
-                                    }
-                                }
-                            }
-                            Err(_) => { rprintln!("Err: ");
-                            None}
-                        }
-                    }
-                    httparse::Status::Partial => { rprintln!("Part: ");
-                    None
-                    }
-                };
-                rgr.release(len);
-
-
-            }
-        }
-    }
-
-    #[task(binds = ETH, shared = [network, rx_bytes], local = [eth_led, prod], priority = 5)]
+    #[task(binds = ETH, shared = [network, rx_bytes], local = [eth_led, prod, bws], priority = 5)]
     fn ethernet_event(mut cx: ethernet_event::Context) {
         unsafe { ethernet::interrupt_handler() }
         cx.local.eth_led.toggle().unwrap();
         let mut rx_len = 0u32;
         let mut prod = cx.local.prod;
+        let mut bws: &mut crate::network::bare_metal_websocket::BareMetalWebSocketServer = cx.local.bws;
         cx.shared.network.lock(|n|{
             match n.poll(crate::time_now().0 as i64){
                 Ok(_) => {}
@@ -288,36 +228,52 @@ mod app {
             {
                 let mut t_s: net::SocketRef<net::TcpSocket> = n.sockets.get::<net::TcpSocket>(n.tcp_handle);
                 if !t_s.is_open() {
-                    //t_s.close();
                     t_s.listen(1234).unwrap();
                 }
-                if t_s.may_recv() {
+                if t_s.can_recv() {
                     let data = t_s.recv(|buffer| {
                         let len = buffer.len();
                         rx_len = len as u32;
-                        match prod.grant_exact(len){
-                            Ok(mut wgr) => {
-                                wgr.copy_from_slice(buffer);
-                                wgr.commit(buffer.len());
-                            }
-                            Err(_) => {},
-                        }
-
                         let mut data: [u8; net::config::TCP_SERVER_RX_SIZE] = [0; net::config::TCP_SERVER_RX_SIZE];
-                        data[0..len].copy_from_slice(&buffer[0..len]);
-                        (len, (data, len))
+                        let to_send = if !bws.is_connected() {
+                            rprintln!("header ws state: {:?}", bws.state);
+                            let wsc_res = crate::network::bare_metal_websocket::https_request_parser(buffer);
+                            if wsc_res.is_some(){
+                                bws.init(wsc_res.unwrap());
+                                match bws.accept() {
+                                    Ok(data) => { Some(data) }
+                                    Err(_) => { None }
+                                }
+                            }
+                            else { None }
+                        }
+                        else {
+                            rprintln!("frame ws state: {:?}", bws.state);
+                            match bws.read(buffer){
+                                Ok(rr) => {
+                                    rprintln!("M_type: {:?}", rr.0);
+                                    rprintln!("data: {:?}", rr.1);
+                                    rr.1
+                                }
+                                Err(_) => {  None }
+                            }
+                        };
+                        match to_send{
+                           Some(to_s) => {
+                               data[..to_s.len()].copy_from_slice(to_s);
+                               (buffer.len(), (data, to_s.len()))
+                           }
+                           None => {
+                               (buffer.len(), (data, 0))
+                           }
+                       }
                     }).unwrap();
                     if t_s.can_send() {
-                        //t_s.send_slice(&data.0[0..data.1]).unwrap();
+                        t_s.send_slice(&data.0[0..data.1]).unwrap();
                         //t_s.write_str(ROOT_HTML).unwrap();
-                        t_s.send_slice(ROOT_HTML.as_bytes()).unwrap();
+                        //t_s.send_slice(ROOT_HTML.as_bytes()).unwrap();
                     }
                 }
-                else if t_s.may_send() {
-                    //t_s.close();
-                }
-                //t_s.state()
-                // t_s.set_keep_alive()
             }
             match n.poll(crate::time_now().0 as i64){
                 Ok(_) => {}
@@ -326,7 +282,6 @@ mod app {
                     t_s.close();
                 }
             };
-            w_s_processor::spawn();
         });
         cx.shared.rx_bytes.lock(|b| {
             *b += rx_len;

@@ -1,3 +1,3 @@
 pub mod config;
 pub mod net;
-pub mod websocket;
+pub mod bare_metal_websocket;
